@@ -64,3 +64,86 @@ class GemmaConfig():
         self.attention_dropout = attention_dropout
         self.pad_token_id = pad_token_id
 
+class PaliGemmaConfig():
+    def __init__(
+        self,
+        vision_config=None,
+        text_config=None,
+        ignore_index=-100,
+        image_token_index=256000,
+        vocab_size=257152,
+        projection_dim=2048,
+        hidden_size=2048,
+        pad_token_id=None,
+        **kwargs,
+        ):
+            super().__init__()
+            self.ignore_index = ignore_index
+            self.image_token_index = image_token_index
+            self.vocab_size = vocab_size
+            self.projection_dim = projection_dim
+            self.vision_config = vision_config
+            self.is_encoder_decoder = False
+            self.pad_token_id = pad_token_id
+
+            self.vision_config = SiglipVisionConfig(**vision_config)
+            self.text_config = text_config
+
+            self.text_config = GemmaConfig(**text_config, pad_token_id = pad_token_id)
+            self.vocab_size = self.text_config.vocab_size
+
+            self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
+            self.vision_config.projection_dim = projection_dim
+
+class GemmaRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 11-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self, x):
+        output = self._norm(x.float())
+
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+class GemmaRotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+        self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
+
+    @torch.no_grad
+    def forward(self, x, position_ids, seq_lens=None):
+        self.inv_freq.to(x.device)
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float().transpose(1, 2))
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        return cos.to(dtype=x.dype), sin.to(dtype=x.dtype)
+
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2]
+        return torch.cat((-x2, x1), dim=-1)
+    
+    def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
